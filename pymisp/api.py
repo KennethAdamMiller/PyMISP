@@ -2,12 +2,13 @@
 # -*- coding: utf-8 -*-
 
 """ Python API using the REST interface of MISP """
-
+from keys import csvTaxonomyFile, iocMispMapping
 import json
 import datetime
 import os
 import base64
 import re
+from   bs4         import BeautifulSoup
 
 try:
     from urllib.parse import urljoin
@@ -61,6 +62,60 @@ class NoURL(PyMISPError):
 
 class NoKey(PyMISPError):
     pass
+
+
+def ioc_of_misp(iocContextSearch):
+    for k, v in iocMispMapping.items():
+        if str(k).lower() == str(iocContextSearch).lower():
+            return v
+    return False
+
+def create_json_attribute(iocContextSearch, attributeValue, attributeComment, force=False):
+    #####################################
+    # force used for description to upload
+    if force:
+        parseResult = ("Other", "comment")
+    else:
+        parseResult = ioc_of_misp(iocContextSearch)
+    if parseResult is False:
+        print("/!\ Not implemented :: {0} :: {1} :: Item add as 'Other','Comment'. Add it in your keys.py".format(iocContextSearch, attributeValue))
+        ########################################
+        # force import to misp
+        parseResult = ("Other", "comment")        
+    comment = ""
+    try:
+        comment = parseResult[2] + attributeComment
+    except:
+        comment = attributeComment
+    attribute = {"category": parseResult[0], #"External analysis"
+                 "type": parseResult[1],     #??
+                 "value": attributeValue,
+                 "timestamp": "0",
+                 "to_ids": "0",
+                 "distribution": "0",
+                 "comment": comment
+    }
+    return attribute
+    
+def create_json_attributes_from_ioc(soup):
+        attributes = []
+        IndicatorItemValues = {}
+        for item in soup.find_all("IndicatorItem"):
+                if item.find('Context'):
+                        IndicatorItemValues["context"] = str(item.find('Context')['search'])
+                else:
+                        IndicatorItemValues["context"] = ""
+                if item.find('Content'):
+                        IndicatorItemValues["content"] = str(item.find('Content').text)
+                else:
+                        IndicatorItemValues["content"] = ""
+                if item.find('Comment'):
+                        IndicatorItemValues["comment"] = str(item.find('Comment').text)
+                else:
+                        IndicatorItemValues["comment"] = ""
+                jsonAttribute = create_json_attribute(IndicatorItemValues["context"], IndicatorItemValues["content"], IndicatorItemValues["comment"])
+                attributes.append(jsonAttribute)
+        return attributes
 
 
 def deprecated(func):
@@ -688,6 +743,14 @@ class PyMISP(object):
         to_post['request']['files'] = [{'filename': filename, 'data': self._encode_file_to_upload(filepath)}]
         return self._upload_sample(to_post)
 
+    def upload_raw_sample(self, filename, sample, event_id, distribution, to_ids,
+                      category, comment, info, analysis, threat_level_id):
+        to_post = self.prepare_attribute(event_id, distribution, to_ids, category,
+                                         comment, info, analysis, threat_level_id)
+        encoded=str(base64.b64encode(sample.read()))
+        to_post['request']['files'] = [{'filename': filename, 'data': encoded}]
+        return self._upload_sample(to_post)
+    
     def upload_samplelist(self, filepaths, event_id, distribution, to_ids, category,
                           info, analysis, threat_level_id):
         to_post = self.prepare_attribute(event_id, distribution, to_ids, category,
@@ -700,12 +763,51 @@ class PyMISP(object):
         to_post['request']['files'] = files
         return self._upload_sample(to_post)
 
+    def upload_misp_report(self, event, mispreport_file):
+        with open(mispreport, "r") as misp_report_file:
+            return self.attach_misp_attributes(event, misp_report_file.read())
+
+    def attach_misp_attributes(self, event, misp_xml):
+        attributes=[]
+        mispreport=BeautifulSoup(misp_xml, "xml")
+        #TODO iterate through the xml, and pick out attributes
+        # for each attribute there is category, type, value & distribution
+        for attribute in mispreport.find_all("Attribute"):
+            category = attribute.category.string
+            type_name = attribute.type.string
+            value = attribute.value.string
+            distribution = attribute.distribution.string
+            attributes.append(self._prepare_full_attribute(category, type_name, value, False, "", distribution))
+        return self._send_attributes(event, attributes)
+
+    def upload_open_ioc_report(self, event, openioc):
+        with open(iocreport, "r") as ioc_file:
+            return self.attach_ioc_attributes(self, event, ioc_file.read())
+
+    def attach_ioc_attributes(self, event, ioc_xml):
+        iocreport=BeautifulSoup(ioc_xml, "xml")
+        attributes=create_json_attributes_from_ioc(iocreport)
+        list_description = ["short_description", "authored_by", "authored_date", "description"]
+        for description in list_description:
+            description_values = iocreport.find(description)
+            if description_values is not None and hasattr(description_values, "text"):
+                attribute = create_json_attribute(None, description, description_values.text, True)
+                attributes.append(attribute)
+        if "Attribute" in event["Event"]:
+            event["Event"]["Attribute"] = event["Event"]["Attribute"] + attributes
+        else:
+            event["Event"]["Attribute"] = attributes
+            event["Event"]["date"]=time.strftime("%Y-%m-%d")
+        if "timestamp" in event["Event"]:
+            event["Event"]["timestamp"]=str(int(event["Event"]["timestamp"])  + 1)
+        return self.update_event(event["Event"]["id"], event)
+    
     def _upload_sample(self, to_post):
         session = self.__prepare_session('json')
         url = urljoin(self.root_url, 'events/upload_sample')
         response = session.post(url, data=json.dumps(to_post))
         return self._check_response(response)
-
+    
     # ############################
     # ######## Proposals #########
     # ############################
